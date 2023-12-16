@@ -1,0 +1,159 @@
+name: Build and deploy site
+
+on:
+  workflow_call:
+    secrets:
+      DOCS_DEPLOY_KEY:
+        required: true
+      CLOUDFLARE_API_TOKEN:
+        required: true
+      CLOUDFLARE_ACCOUNT_ID:
+        required: true
+    inputs:
+      CLOUDFLARE_PROJECT_NAME:
+        required: true
+        type: string
+      PRODUCTION_URL:
+        required: true
+        type: string
+
+jobs:
+  build-and-deploy:
+    name: Build and deploy site
+    runs-on: ubuntu-latest
+    if: ${{
+      github.event_name == 'push' ||
+      (github.event_name == 'pull_request_target' && github.event.pull_request.head.repo.fork == false) ||
+      (github.event_name == 'pull_request_target' && contains(github.event.label.name, 'request-deploy'))
+      }}
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      CLOUDFLARE_PROJECT_NAME: ${{ inputs.CLOUDFLARE_PROJECT_NAME }}
+      PRODUCTION_URL: ${{ inputs.PRODUCTION_URL }}
+    steps:
+      - name: Checkout the main repository
+        uses: actions/checkout@v4
+        with:
+          repository: CompuTec/computec-docs
+          ref: main
+          ssh-key: ${{ secrets.DOCS_DEPLOY_KEY }}
+      - name: Checkout the doc repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.ref }}
+          path: "doc"
+      - name: Create GitHub deployment
+        id: github-deployment
+        uses: actions/github-script@v7
+        with:
+          result-encoding: string
+          script: |
+            const [ref, environment] = (() => {
+              if (context.eventName === 'push') {
+                return [context.sha, 'production'];
+              } else if (context.eventName === 'pull_request_target') {
+                return [context.payload.pull_request.head.sha, `pr${context.payload.number}/${context.payload.pull_request.head.label}`];
+              }
+              
+              throw new Error('Invalid event');
+            })();
+
+            const deployment = await github.rest.repos.createDeployment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: ref,
+              auto_merge: false,
+              required_contexts: [],
+              environment: environment,
+              description: "Cloudflare Pages",
+            });
+
+            return deployment.data.id;
+      - name: Set GitHub 'in_progress' deployment status
+        uses: actions/github-script@v7
+        env:
+          DEPLOYMENT_ID: ${{ steps.github-deployment.outputs.result }}
+        with:
+          script: |
+            await github.rest.repos.createDeploymentStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              deployment_id: process.env.DEPLOYMENT_ID,
+              state: 'in_progress',
+            });
+      - name: Setup Node
+        uses: actions/setup-node@v3
+        with:
+          node-version: 18
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Build website
+        run: npm run build -- --config=docusaurus.single.ts
+      - name: Create Cloudflare Pages deployment
+        id: cloudflare-pages-deployment
+        uses: actions/github-script@v7
+        with:
+          result-encoding: string
+          script: |
+            const [branch, commitHash, commitMessage] = (() => {
+              if (context.eventName === 'push') {
+                return ['main', context.sha, context.payload.head_commit.message];
+              } else if (context.eventName === 'pull_request_target') {
+                return [`pr${context.payload.number}/${context.payload.pull_request.head.label}`, context.payload.pull_request.head.sha, context.payload.pull_request.title];
+              }
+
+              throw new Error('Invalid event');
+            })();
+
+            await exec.exec(`npx wrangler pages deploy "build" --project-name="${process.env.CLOUDFLARE_PROJECT_NAME}" --branch="${branch}" --commit-hash="${commitHash}" --commit-message="${commitMessage}"`);
+
+            const requestUrl = `https://api.cloudflare.com/client/v4/accounts/${process.env.CLOUDFLARE_ACCOUNT_ID}/pages/projects/${process.env.CLOUDFLARE_PROJECT_NAME}`;
+            const response = await fetch(requestUrl, {
+              headers: { Authorization: `Bearer ${process.env.CLOUDFLARE_API_TOKEN}` },
+            });
+
+            const { result } = await response.json();
+
+            return result.latest_deployment.url;
+      - name: Set GitHub 'success' deployment status
+        uses: actions/github-script@v7
+        env:
+          DEPLOYMENT_ID: ${{ steps.github-deployment.outputs.result }}
+          CLOUDFLARE_DEPLOYMENT_URL: ${{ steps.cloudflare-pages-deployment.outputs.result }}
+        with:
+          script: |
+            await github.rest.repos.createDeploymentStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              deployment_id: process.env.DEPLOYMENT_ID,
+              state: 'success',
+              log_url: `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              environment_url: process.env.CLOUDFLARE_DEPLOYMENT_URL,
+            });
+      - name: Set Github 'error' deployment status if build failed
+        uses: actions/github-script@v7
+        if: ${{ failure() && steps.github-deployment.conclusion == 'success' }}
+        env:
+          DEPLOYMENT_ID: ${{ steps.github-deployment.outputs.result }}
+        with:
+          script: |
+            await github.rest.repos.createDeploymentStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              deployment_id: process.env.DEPLOYMENT_ID,
+              state: 'error',
+            });
+      - name: Remove `request-deploy` label
+        if: ${{ github.event_name == 'pull_request_target' && contains(github.event.label.name, 'request-deploy') }}
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            github.rest.issues.removeLabel({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              name: ['request-deploy']
+            })
